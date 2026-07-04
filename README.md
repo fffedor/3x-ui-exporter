@@ -18,6 +18,9 @@ various aspects of your 3X-UI, including node status, traffic flow, system perfo
 data readily
 available for integration with the Prometheus monitoring system.
 
+> **Compatibility:** This exporter targets the **3X-UI v3.0+** API (CSRF-authenticated login). Panels older than
+> v3.0 are not supported.
+
 ## Features
 
 - **Online Monitoring**: Tracks the number of online users across your 3X-UI instance.
