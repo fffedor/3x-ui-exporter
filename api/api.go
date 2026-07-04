@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -92,21 +91,12 @@ func NewAPIClient(cfg APIConfig) *APIClient {
 	}
 }
 
-var (
-	authCache struct {
-		Cookie    http.Cookie
-		CSRFToken string
-		ExpiresAt time.Time
-		sync.Mutex
-	}
-
-	// Buffer pool for request bodies
-	bufferPool = sync.Pool{
-		New: func() interface{} {
-			return new(bytes.Buffer)
-		},
-	}
-)
+var authCache struct {
+	Cookie    http.Cookie
+	CSRFToken string
+	ExpiresAt time.Time
+	sync.Mutex
+}
 
 // fetchCSRFToken retrieves the session CSRF token required by 3X-UI v3.0+.
 // The token is bound to the session cookie the panel sets on this response, so
@@ -164,8 +154,12 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 		return &authCache.Cookie, nil
 	}
 
-	// Best-effort CSRF token for 3X-UI v3.0+; empty on older panels.
+	// 3X-UI v3.0+ requires a CSRF token bound to the session cookie that
+	// /csrf-token sets. Without it the panel returns HTTP 403 on /login.
 	csrfToken, csrfCookie := a.fetchCSRFToken()
+	if csrfToken == "" {
+		return nil, fmt.Errorf("could not obtain CSRF token; 3X-UI v3.0+ required")
+	}
 
 	path := a.config.BaseURL + "/login"
 	data := url.Values{
@@ -173,23 +167,16 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 		"password": {a.config.ApiPassword},
 	}
 
-	buf := bufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	buf.WriteString(data.Encode())
-	defer bufferPool.Put(buf)
-
-	req, err := http.NewRequest("POST", path, buf)
+	req, err := http.NewRequest("POST", path, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if csrfToken != "" {
-		// v3.0+ validates this header against the token stored in the session
-		// that /csrf-token created, so the session cookie must ride along.
-		req.Header.Set("X-CSRF-Token", csrfToken)
-		if csrfCookie != nil {
-			req.AddCookie(csrfCookie)
-		}
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	if csrfCookie != nil {
+		// The token is validated against the session /csrf-token created, so
+		// that session cookie must ride along with the login request.
+		req.AddCookie(csrfCookie)
 	}
 
 	resp, err := a.httpClient.Do(req)
@@ -359,15 +346,14 @@ func (a *APIClient) createRequest(method, path string, cookie *http.Cookie) (*ht
 	req.Header.Set("Accept", "application/json")
 	req.AddCookie(cookie)
 
-	// 3X-UI v3.0+ requires the CSRF token on unsafe methods (e.g. the POST to
-	// /panel/api/inbounds/onlines). Empty on older panels, so this is a no-op there.
-	if method != http.MethodGet && method != http.MethodHead {
-		authCache.Lock()
-		token := authCache.CSRFToken
-		authCache.Unlock()
-		if token != "" {
-			req.Header.Set("X-CSRF-Token", token)
-		}
+	// 3X-UI v3.0+ validates the CSRF token on API requests. Some panels reject
+	// even safe methods without it, so it is attached to every request. Empty
+	// only before the first successful login, where it is a harmless no-op.
+	authCache.Lock()
+	token := authCache.CSRFToken
+	authCache.Unlock()
+	if token != "" {
+		req.Header.Set("X-CSRF-Token", token)
 	}
 
 	return req, nil
