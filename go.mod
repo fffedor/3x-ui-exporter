@@ -3,7 +3,6 @@ module x-ui-exporter
 go 1.24.1
 
 require (
-	github.com/digilolnet/client3xui v0.0.0-20250207025941-9ee70f528c9b
 	github.com/go-co-op/gocron v1.37.0
 	github.com/prometheus/client_golang v1.21.1
 )
