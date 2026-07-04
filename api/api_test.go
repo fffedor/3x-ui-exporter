@@ -37,9 +37,23 @@ func TestFetchOnlineUsersCount(t *testing.T) {
 	}
 }
 
+func TestFetchOnlineUsersCountFailure(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/panel/api/clients/onlines", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"success":false,"msg":"session expired"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c, cookie := newTestClient(ts)
+	if err := c.FetchOnlineUsersCount(cookie); err == nil {
+		t.Fatal("FetchOnlineUsersCount: expected error on success:false response, got nil")
+	}
+}
+
 func TestFetchInboundsList(t *testing.T) {
 	// settings/streamSettings/sniffing are nested OBJECTS here (the v3 shape);
-	// the decode must not choke on them the way client3xui's string fields did.
+	// the decode must not choke on them the way an old string-typed Settings field would.
 	const body = `{"success":true,"obj":[
 		{"id":1,"up":100,"down":200,"remark":"VLESS-443",
 		 "settings":{"clients":[{"email":"alice"}],"decryption":"none"},

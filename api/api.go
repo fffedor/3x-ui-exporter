@@ -30,7 +30,7 @@ type APIClient struct {
 
 // v3 API response envelopes. Only the fields the exporter reads are declared;
 // unknown keys (settings, streamSettings, sniffing — nested JSON objects in v3)
-// are ignored. This is exactly why the string-typed client3xui.Inbound could
+// are ignored. This is exactly why the old string-typed inbound schema could
 // not decode a v3 /inbounds/list response.
 type onlinesResponse struct {
 	Success bool     `json:"success"`
@@ -239,6 +239,10 @@ func (a *APIClient) FetchOnlineUsersCount(cookie *http.Cookie) error {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
 
+	if !response.Success {
+		return fmt.Errorf("onlines: %s", response.Msg)
+	}
+
 	metrics.OnlineUsersCount.Set(float64(len(response.Obj)))
 
 	return nil
@@ -256,6 +260,10 @@ func (a *APIClient) FetchServerStatus(cookie *http.Cookie) error {
 	var response serverStatusResponse
 	if err := json.Unmarshal(body, &response); err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
+	}
+
+	if !response.Success {
+		return fmt.Errorf("server status: %s", response.Msg)
 	}
 
 	// XRay metrics — parsing preserved byte-for-byte from the pre-v3 code so the
@@ -289,6 +297,10 @@ func (a *APIClient) FetchInboundsList(cookie *http.Cookie) error {
 	var response inboundsResponse
 	if err := json.Unmarshal(body, &response); err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
+	}
+
+	if !response.Success {
+		return fmt.Errorf("inbounds list: %s", response.Msg)
 	}
 
 	for _, inb := range response.Obj {
