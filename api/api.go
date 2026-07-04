@@ -49,8 +49,9 @@ func NewAPIClient(cfg APIConfig) *APIClient {
 }
 
 var (
-	cookieCache struct {
+	authCache struct {
 		Cookie    http.Cookie
+		CSRFToken string
 		ExpiresAt time.Time
 		sync.Mutex
 	}
@@ -80,14 +81,64 @@ var (
 	}
 )
 
-func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
-	cookieCache.Lock()
-	defer cookieCache.Unlock()
-
-	remainingTime := time.Until(cookieCache.ExpiresAt).Minutes()
-	if cookieCache.Cookie.Name != "" && remainingTime > 0 {
-		return &cookieCache.Cookie, nil
+// fetchCSRFToken retrieves the session CSRF token required by 3X-UI v3.0+.
+// The token is bound to the session cookie the panel sets on this response, so
+// both are returned and must be carried into the subsequent /login request.
+// Older panels lack this endpoint; on any failure it returns ("", nil) so the
+// caller transparently falls back to the pre-v3 login flow.
+func (a *APIClient) fetchCSRFToken() (string, *http.Cookie) {
+	req, err := http.NewRequest(http.MethodGet, a.config.BaseURL+"/csrf-token", nil)
+	if err != nil {
+		return "", nil
 	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return "", nil
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", nil
+	}
+
+	var csrfResp struct {
+		Success bool   `json:"success"`
+		Obj     string `json:"obj"`
+	}
+	if err := json.Unmarshal(body, &csrfResp); err != nil || !csrfResp.Success || csrfResp.Obj == "" {
+		return "", nil
+	}
+
+	var sessionCookie *http.Cookie
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "3x-ui" {
+			sessionCookie = cookie
+		}
+	}
+
+	return csrfResp.Obj, sessionCookie
+}
+
+func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
+	authCache.Lock()
+	defer authCache.Unlock()
+
+	remainingTime := time.Until(authCache.ExpiresAt).Minutes()
+	if authCache.Cookie.Name != "" && remainingTime > 0 {
+		return &authCache.Cookie, nil
+	}
+
+	// Best-effort CSRF token for 3X-UI v3.0+; empty on older panels.
+	csrfToken, csrfCookie := a.fetchCSRFToken()
 
 	path := a.config.BaseURL + "/login"
 	data := url.Values{
@@ -105,6 +156,14 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if csrfToken != "" {
+		// v3.0+ validates this header against the token stored in the session
+		// that /csrf-token created, so the session cookie must ride along.
+		req.Header.Set("X-CSRF-Token", csrfToken)
+		if csrfCookie != nil {
+			req.AddCookie(csrfCookie)
+		}
+	}
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
@@ -117,6 +176,10 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("authentication failed: HTTP 403 (CSRF token rejected?)")
 	}
 
 	var loginResp struct {
@@ -137,16 +200,18 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 
 	for _, cookie := range resp.Cookies() {
 		if cookie.Name == "3x-ui" {
-			cookieCache.Cookie = *cookie
-			cookieCache.ExpiresAt = time.Now().Add(time.Minute * 59)
+			authCache.Cookie = *cookie
+			authCache.ExpiresAt = time.Now().Add(time.Minute * 59)
 		}
 	}
 
-	if cookieCache.Cookie.Name == "" {
+	if authCache.Cookie.Name == "" {
 		return nil, fmt.Errorf("no cookies found in auth response")
 	}
 
-	return &cookieCache.Cookie, nil
+	authCache.CSRFToken = csrfToken
+
+	return &authCache.Cookie, nil
 }
 
 func (a *APIClient) FetchOnlineUsersCount(cookie *http.Cookie) error {
@@ -294,6 +359,18 @@ func (a *APIClient) createRequest(method, path string, cookie *http.Cookie) (*ht
 
 	req.Header.Set("Accept", "application/json")
 	req.AddCookie(cookie)
+
+	// 3X-UI v3.0+ requires the CSRF token on unsafe methods (e.g. the POST to
+	// /panel/api/inbounds/onlines). Empty on older panels, so this is a no-op there.
+	if method != http.MethodGet && method != http.MethodHead {
+		authCache.Lock()
+		token := authCache.CSRFToken
+		authCache.Unlock()
+		if token != "" {
+			req.Header.Set("X-CSRF-Token", token)
+		}
+	}
+
 	return req, nil
 }
 
