@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 	"x-ui-exporter/metrics"
-
-	"github.com/digilolnet/client3xui"
 )
 
 type APIConfig struct {
@@ -29,6 +27,52 @@ type APIConfig struct {
 type APIClient struct {
 	config     APIConfig
 	httpClient *http.Client
+}
+
+// v3 API response envelopes. Only the fields the exporter reads are declared;
+// unknown keys (settings, streamSettings, sniffing — nested JSON objects in v3)
+// are ignored. This is exactly why the string-typed client3xui.Inbound could
+// not decode a v3 /inbounds/list response.
+type onlinesResponse struct {
+	Success bool     `json:"success"`
+	Msg     string   `json:"msg"`
+	Obj     []string `json:"obj"`
+}
+
+type serverStatusResponse struct {
+	Success bool   `json:"success"`
+	Msg     string `json:"msg"`
+	Obj     struct {
+		Xray struct {
+			Version string `json:"version"`
+		} `json:"xray"`
+		AppStats struct {
+			Threads uint32 `json:"threads"`
+			Mem     uint64 `json:"mem"`
+			Uptime  uint64 `json:"uptime"`
+		} `json:"appStats"`
+	} `json:"obj"`
+}
+
+type inboundsResponse struct {
+	Success bool      `json:"success"`
+	Msg     string    `json:"msg"`
+	Obj     []inbound `json:"obj"`
+}
+
+type inbound struct {
+	ID          int          `json:"id"`
+	Up          int64        `json:"up"`
+	Down        int64        `json:"down"`
+	Remark      string       `json:"remark"`
+	ClientStats []clientStat `json:"clientStats"`
+}
+
+type clientStat struct {
+	ID    int    `json:"id"`
+	Email string `json:"email"`
+	Up    int64  `json:"up"`
+	Down  int64  `json:"down"`
 }
 
 func NewAPIClient(cfg APIConfig) *APIClient {
@@ -54,23 +98,6 @@ var (
 		CSRFToken string
 		ExpiresAt time.Time
 		sync.Mutex
-	}
-
-	// Response object pools
-	apiResponsePool = sync.Pool{
-		New: func() interface{} {
-			return &client3xui.ApiResponse{}
-		},
-	}
-	serverStatusPool = sync.Pool{
-		New: func() interface{} {
-			return &client3xui.ServerStatusResponse{}
-		},
-	}
-	inboundsResponsePool = sync.Pool{
-		New: func() interface{} {
-			return &client3xui.GetInboundsResponse{}
-		},
 	}
 
 	// Buffer pool for request bodies
@@ -215,28 +242,17 @@ func (a *APIClient) GetAuthToken() (*http.Cookie, error) {
 }
 
 func (a *APIClient) FetchOnlineUsersCount(cookie *http.Cookie) error {
-	// Try the new path first for 3X-UI v2.7.0+
-	body, err := a.sendRequest("/panel/api/inbounds/onlines", http.MethodPost, cookie)
-	if err != nil || len(body) == 0 {
-		body, err = a.sendRequest("/panel/inbound/onlines", http.MethodPost, cookie)
-		if err != nil {
-			return fmt.Errorf("onlines (old path fallback): %w", err)
-		}
+	body, err := a.sendRequest("/panel/api/clients/onlines", http.MethodPost, cookie)
+	if err != nil {
+		return fmt.Errorf("onlines: %w", err)
 	}
 
-	response := apiResponsePool.Get().(*client3xui.ApiResponse)
-	defer apiResponsePool.Put(response)
-
-	if err := json.Unmarshal(body, response); err != nil {
+	var response onlinesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
 
-	var arr []json.RawMessage
-	if err := json.Unmarshal(response.Obj, &arr); err != nil {
-		return fmt.Errorf("converting Obj as array: %w", err)
-	}
-
-	metrics.OnlineUsersCount.Set(float64(len(arr)))
+	metrics.OnlineUsersCount.Set(float64(len(response.Obj)))
 
 	return nil
 }
@@ -245,23 +261,18 @@ func (a *APIClient) FetchServerStatus(cookie *http.Cookie) error {
 	// Clear old version metric to avoid accumulating obsolete label values
 	metrics.XrayVersion.Reset()
 
-	// Try GET first for 3X-UI v2.7.0+
 	body, err := a.sendRequest("/panel/api/server/status", http.MethodGet, cookie)
-	if err != nil || len(body) == 0 {
-		body, err = a.sendRequest("/server/status", http.MethodPost, cookie)
-		if err != nil {
-			return fmt.Errorf("server status (POST fallback): %w", err)
-		}
+	if err != nil {
+		return fmt.Errorf("server status: %w", err)
 	}
 
-	response := serverStatusPool.Get().(*client3xui.ServerStatusResponse)
-	defer serverStatusPool.Put(response)
-
-	if err := json.Unmarshal(body, response); err != nil {
+	var response serverStatusResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
 
-	// XRay metrics
+	// XRay metrics — parsing preserved byte-for-byte from the pre-v3 code so the
+	// gauge value for a given version string does not change.
 	xrayVersion := strings.ReplaceAll(response.Obj.Xray.Version, ".", "")
 	num, _ := strconv.ParseFloat(xrayVersion, 64)
 	metrics.XrayVersion.WithLabelValues(response.Obj.Xray.Version).Set(num)
@@ -288,39 +299,27 @@ func (a *APIClient) FetchInboundsList(cookie *http.Cookie) error {
 		return fmt.Errorf("inbounds list: %w", err)
 	}
 
-	response := inboundsResponsePool.Get().(*client3xui.GetInboundsResponse)
-	defer inboundsResponsePool.Put(response)
-
-	if err := json.Unmarshal(body, response); err != nil {
+	var response inboundsResponse
+	if err := json.Unmarshal(body, &response); err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
 
-	for _, inbound := range response.Obj {
-		iid := strconv.Itoa(inbound.ID)
-		metrics.InboundUp.WithLabelValues(
-			iid, inbound.Remark,
-		).Set(float64(inbound.Up))
-
-		metrics.InboundDown.WithLabelValues(
-			iid, inbound.Remark,
-		).Set(float64(inbound.Down))
+	for _, inb := range response.Obj {
+		iid := strconv.Itoa(inb.ID)
+		metrics.InboundUp.WithLabelValues(iid, inb.Remark).Set(float64(inb.Up))
+		metrics.InboundDown.WithLabelValues(iid, inb.Remark).Set(float64(inb.Down))
 
 		n := a.config.ClientsBytesRows
 		if n == 0 {
-			for _, client := range inbound.ClientStats {
+			for _, client := range inb.ClientStats {
 				cid := strconv.Itoa(client.ID)
-				metrics.ClientUp.WithLabelValues(
-					cid, client.Email,
-				).Set(float64(client.Up))
-
-				metrics.ClientDown.WithLabelValues(
-					cid, client.Email,
-				).Set(float64(client.Down))
+				metrics.ClientUp.WithLabelValues(cid, client.Email).Set(float64(client.Up))
+				metrics.ClientDown.WithLabelValues(cid, client.Email).Set(float64(client.Down))
 			}
 		} else {
 			// Top N by Upload
-			sortedUp := make([]client3xui.ClientStat, len(inbound.ClientStats))
-			copy(sortedUp, inbound.ClientStats)
+			sortedUp := make([]clientStat, len(inb.ClientStats))
+			copy(sortedUp, inb.ClientStats)
 			sort.Slice(sortedUp, func(i, j int) bool {
 				return sortedUp[i].Up > sortedUp[j].Up
 			})
@@ -332,8 +331,8 @@ func (a *APIClient) FetchInboundsList(cookie *http.Cookie) error {
 			}
 
 			// Top N by Download
-			sortedDown := make([]client3xui.ClientStat, len(inbound.ClientStats))
-			copy(sortedDown, inbound.ClientStats)
+			sortedDown := make([]clientStat, len(inb.ClientStats))
+			copy(sortedDown, inb.ClientStats)
 			sort.Slice(sortedDown, func(i, j int) bool {
 				return sortedDown[i].Down > sortedDown[j].Down
 			})
