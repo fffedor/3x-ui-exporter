@@ -11,6 +11,15 @@ step() {
   echo -e "\n${GREEN}[$1/8] $2${NC}"
 }
 
+# Prompt to continue after a non-fatal validation issue, or abort the install.
+confirm_continue_or_abort() {
+  read -p "Continue anyway? (y/N): " CONTINUE
+  if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
+    echo "Installation aborted."
+    exit 1
+  fi
+}
+
 # Check if script is run as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: This script must be run as root (sudo)."
@@ -174,44 +183,44 @@ if [ $SKIP_CONFIG_SETUP -eq 0 ]; then
         fi
     done
 
-    # Validate connection to panel
+    # Validate connection to panel (3X-UI v3.0+ CSRF-aware login, mirroring the exporter)
     echo "Validating connection to panel..."
     TEMP_RESPONSE=$(mktemp)
-    CURL_EXIT_CODE=0
-    LOGIN_RESULT=$(curl -s -w "%{http_code}" -o "$TEMP_RESPONSE" -X POST "${PANEL_URL}/login" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${PANEL_USERNAME}\",\"password\":\"${PANEL_PASSWORD}\"}" || { CURL_EXIT_CODE=$?; echo "000"; })
+    COOKIE_JAR=$(mktemp)
+
+    # 1) Mint a CSRF token (v3.0+); the session cookie is stored in COOKIE_JAR.
+    CSRF_TOKEN=$(curl -s --max-time 15 -c "$COOKIE_JAR" -H "Accept: application/json" \
+        "${PANEL_URL}/csrf-token" | grep -Po '"obj"\s*:\s*"\K[^"]*')
+
+    # 2) Log in carrying the CSRF token + session cookie, form-urlencoded like the exporter.
+    CSRF_HEADER=()
+    [ -n "$CSRF_TOKEN" ] && CSRF_HEADER=(-H "X-CSRF-Token: ${CSRF_TOKEN}")
+    LOGIN_RESULT=$(curl -s --max-time 15 -w "%{http_code}" -o "$TEMP_RESPONSE" -X POST "${PANEL_URL}/login" \
+        -b "$COOKIE_JAR" \
+        "${CSRF_HEADER[@]}" \
+        --data-urlencode "username=${PANEL_USERNAME}" \
+        --data-urlencode "password=${PANEL_PASSWORD}")
+    CURL_EXIT_CODE=$?
+
+    LOGIN_BODY=$(cat "$TEMP_RESPONSE" 2>/dev/null)
+    LOGIN_MSG=$(echo "$LOGIN_BODY" | grep -Po '"msg"\s*:\s*"\K[^"]*')
+    rm -f "$TEMP_RESPONSE" "$COOKIE_JAR"
 
     if [ $CURL_EXIT_CODE -ne 0 ]; then
         echo "Failed to connect to panel. Network error (curl exit code: $CURL_EXIT_CODE)"
         echo "Please check if the panel URL is correct and the server is reachable."
-        read -p "Continue anyway? (y/n): " CONTINUE
-        if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-            rm -f "$TEMP_RESPONSE"
-            echo "Installation aborted."
-            exit 1
-        fi
-    elif [ "$LOGIN_RESULT" == "200" ] || [ "$LOGIN_RESULT" == "303" ]; then
+        confirm_continue_or_abort
+    elif [ -z "$CSRF_TOKEN" ]; then
+        echo "Panel returned no CSRF token from ${PANEL_URL}/csrf-token."
+        echo "This exporter requires 3X-UI v3.0+; older panels are not supported."
+        confirm_continue_or_abort
+    elif echo "$LOGIN_BODY" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
         echo "Successfully connected to panel!"
-    elif [ "$LOGIN_RESULT" == "401" ] || [ "$LOGIN_RESULT" == "403" ]; then
-        echo "Authentication failed. Invalid username or password."
-        read -p "Continue anyway? (y/n): " CONTINUE
-        if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-            rm -f "$TEMP_RESPONSE"
-            echo "Installation aborted."
-            exit 1
-        fi
     else
-        echo "Failed to connect to panel. HTTP status: ${LOGIN_RESULT}"
-        echo "Please verify your panel URL and credentials."
-        read -p "Continue anyway? (y/n): " CONTINUE
-        if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-            rm -f "$TEMP_RESPONSE"
-            echo "Installation aborted."
-            exit 1
-        fi
+        echo "Authentication failed (HTTP ${LOGIN_RESULT})${LOGIN_MSG:+: ${LOGIN_MSG}}."
+        echo "Please verify your panel username and password."
+        confirm_continue_or_abort
     fi
-    rm -f "$TEMP_RESPONSE"
 
     # Update the config file with user input
     echo "Updating configuration file with provided details..."

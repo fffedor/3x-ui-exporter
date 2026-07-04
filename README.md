@@ -150,7 +150,7 @@ deployment preferences. Select the installation method that aligns best with you
 The easiest way to install the exporter is using automatic installation script:
 
 ```bash
-bash <(curl -fsSL raw.githubusercontent.com/hteppl/3x-ui-exporter/main/install.sh)
+bash <(curl -fsSL raw.githubusercontent.com/fffedor/3x-ui-exporter/main/install.sh)
 ```
 
 During installation, you'll be prompted to enter:
