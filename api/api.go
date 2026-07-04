@@ -101,8 +101,8 @@ var authCache struct {
 // fetchCSRFToken retrieves the session CSRF token required by 3X-UI v3.0+.
 // The token is bound to the session cookie the panel sets on this response, so
 // both are returned and must be carried into the subsequent /login request.
-// Older panels lack this endpoint; on any failure it returns ("", nil) so the
-// caller transparently falls back to the pre-v3 login flow.
+// Older panels lack this endpoint; on any failure it returns ("", nil), which
+// GetAuthToken now treats as a hard authentication failure (3X-UI v3.0+ is required).
 func (a *APIClient) fetchCSRFToken() (string, *http.Cookie) {
 	req, err := http.NewRequest(http.MethodGet, a.config.BaseURL+"/csrf-token", nil)
 	if err != nil {

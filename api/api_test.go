@@ -173,6 +173,9 @@ func TestGetAuthTokenSuccess(t *testing.T) {
 		if got := r.Header.Get("X-CSRF-Token"); got != "tok123" {
 			t.Errorf("login X-CSRF-Token = %q, want tok123", got)
 		}
+		if c, err := r.Cookie("3x-ui"); err != nil || c.Value != "csrf-sess" {
+			t.Errorf("login must carry the /csrf-token session cookie; got %v (err %v)", c, err)
+		}
 		http.SetCookie(w, &http.Cookie{Name: "3x-ui", Value: "auth-sess"})
 		_, _ = w.Write([]byte(`{"success":true,"msg":"ok"}`))
 	})
